@@ -14,6 +14,7 @@
 
 """SigV4 Helper for AWS request signing functionality."""
 
+import asyncio
 import boto3
 import httpx
 import json
@@ -286,13 +287,17 @@ async def _sign_request_hook(
     # Set Content-Length for signing
     request.headers['Content-Length'] = str(len(request.content))
 
-    # Refresh session if a previous request got an auth error.
-    # Done here (at signing time) so the new session reads credentials
-    # that the user may have refreshed since the error occurred.
-    session_holder.refresh_if_needed()
+    # Refresh session and resolve credentials in a thread to avoid
+    # asyncio/subprocess conflicts on Windows when credential_process is used.
+    # botocore spawns a subprocess to run credential_process, which can fail
+    # or hang when called from within a running ProactorEventLoop.
+    loop = asyncio.get_running_loop()
 
-    # Get AWS credentials from the session
-    credentials = session_holder.session.get_credentials()
+    def _resolve_credentials():
+        session_holder.refresh_if_needed()
+        return session_holder.session.get_credentials()
+
+    credentials = await loop.run_in_executor(None, _resolve_credentials)
 
     # Create SigV4 auth and use its signing logic
     auth = SigV4HTTPXAuth(credentials, service, region)
