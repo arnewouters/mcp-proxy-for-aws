@@ -19,6 +19,7 @@ import boto3
 import httpx
 import json
 import logging
+import subprocess
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
@@ -30,6 +31,33 @@ from typing import Any, Dict, Generator, Optional
 
 
 logger = logging.getLogger(__name__)
+
+# Monkey-patch botocore's ProcessProvider to pass stdin=DEVNULL when spawning
+# credential_process subprocesses. Without this, the child process inherits
+# stdin from the parent. When the proxy runs in MCP stdio mode, stdin is the
+# MCP protocol pipe — causing the credential_process to hang on Windows
+# (and potentially on other platforms) waiting for input or holding the pipe.
+try:
+    from botocore.credentials import ProcessProvider
+
+    _original_retrieve = ProcessProvider._retrieve_credentials_using
+
+    def _patched_retrieve(self, credential_process):
+        original_popen = self._popen
+
+        def popen_with_devnull(*args, **kwargs):
+            kwargs.setdefault('stdin', subprocess.DEVNULL)
+            return original_popen(*args, **kwargs)
+
+        self._popen = popen_with_devnull
+        try:
+            return _original_retrieve(self, credential_process)
+        finally:
+            self._popen = original_popen
+
+    ProcessProvider._retrieve_credentials_using = _patched_retrieve
+except (ImportError, AttributeError):
+    pass  # botocore version without ProcessProvider; nothing to patch
 
 # Headers that should be redacted when logging to prevent credential exposure
 SENSITIVE_HEADERS = frozenset({'authorization', 'x-amz-security-token', 'x-amz-date'})
