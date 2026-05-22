@@ -287,17 +287,35 @@ async def _sign_request_hook(
     # Set Content-Length for signing
     request.headers['Content-Length'] = str(len(request.content))
 
-    # Refresh session and resolve credentials in a thread to avoid
-    # asyncio/subprocess conflicts on Windows when credential_process is used.
-    # botocore spawns a subprocess to run credential_process, which can fail
-    # or hang when called from within a running ProactorEventLoop.
+    # Resolve credentials in a thread to avoid asyncio/subprocess conflicts
+    # on Windows when credential_process is used. botocore's ProcessProvider
+    # spawns a subprocess via Popen.communicate(), and RefreshableCredentials
+    # may re-invoke it lazily on property access. Calling get_frozen_credentials()
+    # inside the executor forces the full resolution (including any subprocess
+    # calls) to happen off the event loop.
     loop = asyncio.get_running_loop()
 
     def _resolve_credentials():
         session_holder.refresh_if_needed()
-        return session_holder.session.get_credentials()
+        creds = session_holder.session.get_credentials()
+        if creds is None:
+            return None
+        # get_frozen_credentials() forces refresh if expired, ensuring
+        # any credential_process subprocess runs in this thread.
+        return creds.get_frozen_credentials()
 
-    credentials = await loop.run_in_executor(None, _resolve_credentials)
+    try:
+        credentials = await asyncio.wait_for(
+            loop.run_in_executor(None, _resolve_credentials),
+            timeout=30,
+        )
+    except asyncio.TimeoutError:
+        raise ValueError(
+            'Timed out resolving AWS credentials. If using credential_process, '
+            'verify the command runs successfully outside of this proxy: '
+            'check that it completes within 30s, does not wait for stdin, '
+            'and outputs valid JSON to stdout.'
+        )
 
     # Create SigV4 auth and use its signing logic
     auth = SigV4HTTPXAuth(credentials, service, region)
